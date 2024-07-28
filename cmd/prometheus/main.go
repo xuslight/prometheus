@@ -785,6 +785,7 @@ func main() {
 
 		queryEngine = promql.NewEngine(opts)
 
+		// 如果是 server mode，才需要有处理 rule 的机制
 		ruleManager = rules.NewManager(&rules.ManagerOptions{
 			Appendable:             fanoutStorage,
 			Queryable:              localStorage,

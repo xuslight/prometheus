@@ -206,6 +206,7 @@ func (g *Group) run(ctx context.Context) {
 	defer close(g.terminated)
 
 	// Wait an initial amount to have consistently slotted intervals.
+	// 在实际执行 loop 开始之前，先等待一段时间确保评估间隔的一致性和对齐，对于需要精确控制时间的监控和告警系统很关键
 	evalTimestamp := g.EvalTimestamp(time.Now().UnixNano()).Add(g.interval)
 	select {
 	case <-time.After(time.Until(evalTimestamp)):
@@ -249,7 +250,11 @@ func (g *Group) run(ctx context.Context) {
 		}(time.Now())
 	}()
 
+	// 这里执行了一次 rule，具体的执行模式还要看配置
+	// 是一开始需要执行一次，之后每次都等 ticker 就可以了
 	g.evalIterationFunc(ctx, g, evalTimestamp)
+	// 是否需要重新评估？是什么意思...
+	// 问了 GPT-4o 说是是否应该执行回复操作，比如说因为重启之类的操作之后，是否需要恢复数据
 	if g.shouldRestore {
 		// If we have to restore, we wait for another Eval to finish.
 		// The reason behind this is, during first eval (or before it)
@@ -259,6 +264,7 @@ func (g *Group) run(ctx context.Context) {
 		case <-g.done:
 			return
 		case <-tick.C:
+			// 因为上一次没有及时完成而错过的执行次数，会打印出来呢
 			missed := (time.Since(evalTimestamp) / g.interval) - 1
 			if missed > 0 {
 				g.metrics.IterationsMissed.WithLabelValues(GroupKey(g.file, g.name)).Add(float64(missed))
@@ -276,6 +282,7 @@ func (g *Group) run(ctx context.Context) {
 		g.shouldRestore = false
 	}
 
+	// 执行 loop
 	for {
 		select {
 		case <-g.done:
@@ -290,6 +297,7 @@ func (g *Group) run(ctx context.Context) {
 					g.metrics.IterationsMissed.WithLabelValues(GroupKey(g.file, g.name)).Add(float64(missed))
 					g.metrics.IterationsScheduled.WithLabelValues(GroupKey(g.file, g.name)).Add(float64(missed))
 				}
+				// evalTimestamp 其实就是
 				evalTimestamp = evalTimestamp.Add((missed + 1) * g.interval)
 
 				g.evalIterationFunc(ctx, g, evalTimestamp)
@@ -475,12 +483,14 @@ func (g *Group) CopyState(from *Group) {
 
 // Eval runs a single evaluation cycle in which all rules are evaluated sequentially.
 // Rules can be evaluated concurrently if the `concurrent-rule-eval` feature flag is enabled.
+// Eval 默认顺序执行 rules，如果设置了 concurrent-rule-eval 那么并发执行
 func (g *Group) Eval(ctx context.Context, ts time.Time) {
 	var (
 		samplesTotal atomic.Float64
 		wg           sync.WaitGroup
 	)
 
+	// 规则查询起始时间，这个配置项指定了在评估规则时，从当前时间往前推多少时间来获取历史数据，默认 0
 	ruleQueryOffset := g.QueryOffset()
 
 	for i, rule := range g.rules {
@@ -495,6 +505,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				defer cleanup()
 			}
 
+			// 一大段都是 trace 和 metric 的内容
 			logger := log.WithPrefix(g.logger, "name", rule.Name(), "index", i)
 			ctx, sp := otel.Tracer("").Start(ctx, "rule")
 			sp.SetAttributes(attribute.String("name", rule.Name()))
@@ -513,6 +524,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 
 			g.metrics.EvalTotal.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
 
+			// 执行的结果 vector
 			vector, err := rule.Eval(ctx, ruleQueryOffset, ts, g.opts.QueryFunc, g.opts.ExternalURL, g.Limit())
 			if err != nil {
 				rule.SetHealth(HealthBad)
@@ -532,6 +544,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			rule.SetLastError(nil)
 			samplesTotal.Add(float64(len(vector)))
 
+			// 如果是告警规则，那么发送告警
 			if ar, ok := rule.(*AlertingRule); ok {
 				ar.sendAlerts(ctx, ts, g.opts.ResendDelay, g.interval, g.opts.NotifyFunc)
 			}
@@ -541,6 +554,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				numDuplicates = 0
 			)
 
+			// 这个 Appendable.Appender 会返回写入存储的接口
 			app := g.opts.Appendable.Appender(ctx)
 			seriesReturned := make(map[string]labels.Labels, len(g.seriesInPreviousEval[i]))
 			defer func() {
@@ -556,6 +570,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				g.seriesInPreviousEval[i] = seriesReturned
 			}()
 
+			// 将返回的 vector append 到存储中，内部逻辑就是存储的逻辑了
 			for _, s := range vector {
 				if s.H != nil {
 					_, err = app.AppendHistogram(0, s.Metric, s.T, nil, s.H)
@@ -585,6 +600,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 						level.Warn(logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
 					}
 				} else {
+					// 如果没有 err，存储成功，那么保存下来到 seriesReturned，用于后续判断
 					buf := [1024]byte{}
 					seriesReturned[string(s.Metric.Bytes(buf[:]))] = s.Metric
 				}
@@ -602,6 +618,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			for metric, lset := range g.seriesInPreviousEval[i] {
 				if _, ok := seriesReturned[metric]; !ok {
 					// Series no longer exposed, mark it stale.
+					// 指标不再暴露，设置为 stale，表示指标已经是陈旧的了，StaleNaN 表示数据已经过期
 					_, err = app.Append(0, lset, timestamp.FromTime(ts.Add(-ruleQueryOffset)), math.Float64frombits(value.StaleNaN))
 					unwrappedErr := errors.Unwrap(err)
 					if unwrappedErr == nil {
@@ -621,6 +638,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			}
 		}
 
+		// 默认是顺序执行，不是并发执行的
 		if ctrl := g.concurrencyController; ctrl.Allow(ctx, g, rule) {
 			wg.Add(1)
 
@@ -639,6 +657,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 	g.cleanupStaleSeries(ctx, ts)
 }
 
+// QueryOffset 用于规则计算时调整查询时间，以应对数据延迟和确保数据的有效性
 func (g *Group) QueryOffset() time.Duration {
 	if g.queryOffset != nil {
 		return *g.queryOffset
@@ -659,6 +678,7 @@ func (g *Group) cleanupStaleSeries(ctx context.Context, ts time.Time) {
 	queryOffset := g.QueryOffset()
 	for _, s := range g.staleSeries {
 		// Rule that produced series no longer configured, mark it stale.
+		// 写入特殊值 StaleNaN 表示这个指标是已经过期的
 		_, err := app.Append(0, s, timestamp.FromTime(ts.Add(-queryOffset)), math.Float64frombits(value.StaleNaN))
 		unwrappedErr := errors.Unwrap(err)
 		if unwrappedErr == nil {

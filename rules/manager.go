@@ -74,10 +74,12 @@ func EngineQueryFunc(engine promql.QueryEngine, q storage.Queryable) QueryFunc {
 // accordingly. Custom GroupEvalIterationFunc implementations are recommended
 // to invoke this function as well, to ensure correct Group state and metrics
 // are maintained.
+// 默认的周期执行函数...
 func DefaultEvalIterationFunc(ctx context.Context, g *Group, evalTimestamp time.Time) {
 	g.metrics.IterationsScheduled.WithLabelValues(GroupKey(g.file, g.name)).Inc()
 
 	start := time.Now()
+	// 具体的执行环节
 	g.Eval(ctx, evalTimestamp)
 	timeSinceStart := time.Since(start)
 
@@ -230,6 +232,7 @@ func (m *Manager) Update(interval time.Duration, files []string, externalLabels 
 		wg.Add(1)
 		go func(newg *Group) {
 			if ok {
+				// 停止 oldg 的执行 loop
 				oldg.stop()
 				newg.CopyState(oldg)
 			}
@@ -286,6 +289,7 @@ func (FileLoader) Load(identifier string) (*rulefmt.RuleGroups, []error) {
 func (FileLoader) Parse(query string) (parser.Expr, error) { return parser.ParseExpr(query) }
 
 // LoadGroups reads groups from a list of files.
+// LoadGroups 主要都是 load files，另外就是其他的一些参数无所谓
 func (m *Manager) LoadGroups(
 	interval time.Duration, externalLabels labels.Labels, externalURL string, groupEvalIterationFunc GroupEvalIterationFunc, filenames ...string,
 ) (map[string]*Group, []error) {
@@ -356,6 +360,7 @@ func (m *Manager) LoadGroups(
 }
 
 // RuleGroups returns the list of manager's rule groups.
+// 这个一看就是给 api 用的
 func (m *Manager) RuleGroups() []*Group {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
@@ -448,7 +453,9 @@ type ruleDependencyController struct{}
 func (c ruleDependencyController) AnalyseRules(rules []Rule) {
 	depMap := buildDependencyMap(rules)
 	for _, r := range rules {
+		// dependents 指的是依赖于当前规则的其他规则
 		r.SetNoDependentRules(depMap.dependents(r) == 0)
+		// dependencies 指的是当前规则依赖于其他规则
 		r.SetNoDependencyRules(depMap.dependencies(r) == 0)
 	}
 }
